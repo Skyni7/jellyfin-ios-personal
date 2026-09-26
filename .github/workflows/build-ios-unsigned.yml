@@ -1,0 +1,194 @@
+# 放在你自己的 jellyfin-ios 仓库：.github/workflows/build-ios-unsigned.yml
+# 自用构建：不上传 App Store，不使用 Apple 账号、证书或其他 Secrets。
+# 核对基线：2026-09-26 的 jellyfin/jellyfin-ios。
+# 这是待运行的构建配置，不是已经验证通过的 iOS 安装包。
+name: Build iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned iPhone app
+    # 与核对时上游的 macOS / Xcode 版本保持一致，不使用浮动的 macos-latest。
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: 'true'
+      EXPO_NO_TELEMETRY: '1'
+      COCOAPODS_DISABLE_STATS: 'true'
+      RCT_NO_LAUNCH_PACKAGER: '1'
+      XCODE_PATH: /Applications/Xcode_26.6.app/Contents/Developer
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1，与上游一致
+        with:
+          persist-credentials: false
+
+      - name: Check source and select Xcode
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          test -f package-lock.json
+          test -f Gemfile.lock
+          test -f ios/Podfile.lock
+          test -f ios/Jellyfin.xcodeproj/project.pbxproj
+          if [ ! -d "$XCODE_PATH" ]; then
+            echo '::error::指定的 Xcode 不在当前 runner 中；请根据 runner 镜像清单更新版本。'
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select --switch "$XCODE_PATH"
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo "Run: $GITHUB_RUN_ID / attempt $GITHUB_RUN_ATTEMPT"
+            sw_vers
+            xcodebuild -version
+          } | tee build-logs/environment.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0，与上游一致
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Set up Ruby and locked gems
+        uses: ruby/setup-ruby@8aeb6ff8030dd539317f8e1769a044873b56ea71 # v1.268.0，与上游一致
+        with:
+          ruby-version: '3.1'
+          bundler-cache: true
+
+      - name: Install npm dependencies
+        run: |
+          set -euo pipefail
+          { node --version; npm --version; ruby --version; bundle --version; } | tee -a build-logs/environment.txt
+          npm ci --no-audit 2>&1 | tee build-logs/npm-ci.log
+
+      - name: Prepare personal build settings
+        run: |
+          set -euo pipefail
+          # 在云端设置正确的 Node 路径；不用本地电脑的路径。
+          printf 'export NODE_BINARY=%q\n' "$(command -v node)" > ios/.xcode.env.local
+          python3 - <<'PY'
+          import json
+          import os
+          import plistlib
+          import re
+          from pathlib import Path
+
+          # 区分自用包与官方客户端；不写入任何服务器地址、账号或密码。
+          owner = re.sub(r'[^a-z0-9-]', '', os.environ['GITHUB_REPOSITORY_OWNER'].lower())
+          if not owner:
+              raise SystemExit('无法确定仓库所有者。')
+          new_id = 'app.personal.jellyfin.u' + owner
+          old_id = 'org.jellyfin.expo'
+          build_number = '1.' + os.environ['GITHUB_RUN_NUMBER'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
+
+          project = Path('ios/Jellyfin.xcodeproj/project.pbxproj')
+          content = project.read_text(encoding='utf-8')
+          if old_id not in content:
+              raise SystemExit('上游 Bundle ID 已变化，请先核对工程，不要盲目替换。')
+          project.write_text(content.replace(old_id, new_id), encoding='utf-8')
+
+          info_path = Path('ios/Jellyfin/Info.plist')
+          info = plistlib.loads(info_path.read_bytes())
+          info['CFBundleDisplayName'] = 'Jellyfin 自用'
+          info['CFBundleVersion'] = build_number
+          info['NSLocalNetworkUsageDescription'] = '用于连接局域网中的 Jellyfin 服务器，浏览和播放你的视频。'
+          for entry in info.get('CFBundleURLTypes', []):
+              entry['CFBundleURLSchemes'] = [new_id if s == old_id else s for s in entry.get('CFBundleURLSchemes', [])]
+          info_path.write_bytes(plistlib.dumps(info, sort_keys=False))
+
+          # 不申请原工程的推送和自定义设备名称权限；本轮只验证浏览、播放。
+          Path('ios/Jellyfin/Jellyfin.entitlements').write_bytes(plistlib.dumps({}))
+          app_path = Path('app.json')
+          app = json.loads(app_path.read_text(encoding='utf-8'))
+          expo = app['expo']
+          expo['name'] = 'Jellyfin 自用'
+          expo.pop('owner', None)
+          expo['ios']['bundleIdentifier'] = new_id
+          expo['ios']['buildNumber'] = build_number
+          expo['ios'].pop('entitlements', None)
+          app_path.write_text(json.dumps(app, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          print('自用 Bundle ID:', new_id)
+          print('构建版本:', build_number)
+          PY
+
+      - name: Install CocoaPods dependencies
+        run: |
+          set -euo pipefail
+          bundle exec pod install --project-directory=ios --deployment 2>&1 | tee build-logs/pod-install.log
+          test -d ios/Jellyfin.xcworkspace
+
+      - name: Build unsigned Release app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace ios/Jellyfin.xcworkspace \
+            -scheme Jellyfin \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            CODE_SIGN_ENTITLEMENTS='' \
+            DEVELOPMENT_TEAM='' \
+            ENABLE_BITCODE=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build-logs/xcodebuild.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH='build/DerivedData/Build/Products/Release-iphoneos/Jellyfin.app'
+          test -d "$APP_PATH"
+          test -s "$APP_PATH/Info.plist"
+          # Release 必须自带 JS，不能依赖 Windows 上的开发服务器。
+          if [ ! -s "$APP_PATH/main.jsbundle" ]; then
+            echo '::error::缺少 main.jsbundle；不能将依赖开发服务器的应用作为完成品。'
+            exit 1
+          fi
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
+          test -s "$APP_PATH/$EXECUTABLE"
+          xcrun lipo -info "$APP_PATH/$EXECUTABLE"
+          xcrun lipo -verify_arch arm64 "$APP_PATH/$EXECUTABLE"
+          mkdir -p build/package/Payload build/output
+          ditto "$APP_PATH" build/package/Payload/Jellyfin.app
+          (cd build/package && /usr/bin/zip -qry ../output/Jellyfin-unsigned.ipa Payload)
+          unzip -t build/output/Jellyfin-unsigned.ipa > build-logs/ipa-check.log
+          (cd build/output && shasum -a 256 Jellyfin-unsigned.ipa > SHA256SUMS.txt)
+          cp build-logs/environment.txt build/output/build-info.txt
+          echo '已生成未签名 IPA；需在自己的电脑上签名后才能安装到 iPhone。' >> "$GITHUB_STEP_SUMMARY"
+          echo '未执行真机播放测试；没有上传 Apple 凭证或连接 Jellyfin 服务器。' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-unsigned-ipa
+          path: build/output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-build-logs
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
