@@ -165,7 +165,7 @@ jobs:
           EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
           test -s "$APP_PATH/$EXECUTABLE"
           xcrun lipo -info "$APP_PATH/$EXECUTABLE"
-          xcrun lipo -verify_arch arm64 "$APP_PATH/$EXECUTABLE"
+          xcrun lipo "$APP_PATH/$EXECUTABLE" -verify_arch arm64
           mkdir -p build/package/Payload build/output
           ditto "$APP_PATH" build/package/Payload/Jellyfin.app
           (cd build/package && /usr/bin/zip -qry ../output/Jellyfin-unsigned.ipa Payload)
